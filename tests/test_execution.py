@@ -220,13 +220,35 @@ class TestVerdicts:
         assert verdict.error_type == "startup"
         assert "freepages < neededpages" in verdict.error_message
 
-    def test_an_instant_exit_with_a_stability_message_keeps_the_generic_line(self, tmp_path):
+    def test_an_instant_exit_preserves_an_explicit_stability_failure(self, tmp_path):
         backend = FakeBackend(_child("import sys; sys.exit(1)"), parse=(False, "fake error: FATAL"))
         supervisor, _, _ = make_supervisor(backend)
         with patch.object(execution, "STARTUP_WINDOW_SECONDS", 60.0):
             verdict = run_one(supervisor, lane(tmp_path), 1.0)
-        assert verdict is not None and verdict.error_type == "startup"
-        assert "FATAL" not in verdict.error_message
+        assert verdict is not None and verdict.error_type == "computation"
+        assert "FATAL" in verdict.error_message
+
+    @pytest.mark.parametrize("destination", ["stdout", "stderr", "results"])
+    def test_mprime_fast_rounding_failure_is_not_a_startup_fault(self, tmp_path, destination):
+        from corecycler.engine.backends.mprime import MprimeBackend
+
+        message = "FATAL ERROR: Rounding was 0.5, expected less than 0.4"
+        if destination == "results":
+            code = f"from pathlib import Path; Path('results.txt').write_text({message!r})"
+        else:
+            code = f"import sys; print({message!r}, file=sys.{destination})"
+
+        class SimulatedMprime(MprimeBackend):
+            def get_command(self, config, work_dir):
+                return _child(code)
+
+        supervisor, _, _ = make_supervisor(SimulatedMprime())
+        # Force the failure to arrive between live polling and exit handling.
+        with patch.object(supervisor, "_poll_backend_errors", return_value=False):
+            verdict = run_one(supervisor, lane(tmp_path), 1.0)
+        assert verdict is not None and not verdict.passed
+        assert verdict.error_type == "computation"
+        assert "FATAL ERROR" in verdict.error_message
 
     def test_a_parsed_failure_is_attributed(self, tmp_path):
         backend = FakeBackend(

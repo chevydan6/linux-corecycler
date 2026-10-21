@@ -383,6 +383,10 @@ class Supervisor:
                         error_type="killed",
                     )
                     return self.stop_on_first_failure
+                failure = self._reported_failure(run, rc)
+                if failure:
+                    self._fail(run, failure, start)
+                    return self.stop_on_first_failure
                 if rc not in KILLED_BY_US_CODES and now - run.started_at < STARTUP_WINDOW_SECONDS:
                     log.warning(
                         "Stress process for core %d exited in <%.0fs (code %d) — "
@@ -472,6 +476,16 @@ class Supervisor:
             return False
         return now - run.last_active > self.stall_timeout
 
+    def _reported_failure(self, run: _LaneRun, rc: int) -> str | None:
+        """Explicit test failures outrank the early-exit startup heuristic."""
+        live_error = self.backend.poll_errors(run.lane.work_dir)
+        if live_error:
+            return live_error
+        passed, message = self.backend.parse_output(run.stdout or "", run.stderr or "", rc)
+        if not passed and message and classify_error(message) in {"computation", "crash", "mce"}:
+            return message
+        return None
+
     def _startup_message(self, run: _LaneRun, rc: int, fallback: str) -> str:
         """A backend that names the environment fault in its output outranks the generic line."""
         passed, msg = self.backend.parse_output(run.stdout or "", run.stderr or "", rc)
@@ -555,6 +569,15 @@ class Supervisor:
                 error_message=(f"Stress process killed externally (code {rc}) — possible OOM or system issue"),
                 error_type="killed",
             )
+        failure = self._reported_failure(run, rc)
+        if failure:
+            return StressResult(
+                core_id=run.lane.core_id,
+                passed=False,
+                duration_seconds=elapsed,
+                error_message=failure,
+                error_type=classify_error(failure),
+            )
         if rc != 0 and rc not in KILLED_BY_US_CODES and elapsed < STARTUP_WINDOW_SECONDS:
             return StressResult(
                 core_id=run.lane.core_id,
@@ -636,6 +659,8 @@ def classify_error(msg: str | None) -> str:
     if any(
         w in msg_lower
         for w in (
+            "hardware failure",
+            "torture test failed",
             "rounding",
             "fatal",
             "illegal",
