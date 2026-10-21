@@ -1171,6 +1171,11 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
             return None
         return self._row_to_tuner_session(row)
 
+    def update_tuner_session_config(self, session_id: int, config_json: str) -> None:
+        """Persist explicitly edited settings for a saved tuner session."""
+        self.__conn.execute("UPDATE tuner_sessions SET config_json=? WHERE id=?", (config_json, session_id))
+        self.__conn.commit()
+
     def get_latest_tuner_session(self) -> TunerSession | None:
         row = self.__conn.execute("SELECT * FROM tuner_sessions ORDER BY id DESC LIMIT 1").fetchone()
         if row is None:

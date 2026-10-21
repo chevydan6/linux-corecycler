@@ -31,6 +31,7 @@ from corecycler.engine.detector import (
 )
 from corecycler.engine.execution import busy_fraction as _busy_fraction
 from corecycler.engine.execution import cpu_times as _read_cpu_times
+from corecycler.engine.execution import read_cpu_temperature
 from corecycler.engine.memory_budget import MemoryBudgetUnavailable, memory_budget
 from corecycler.engine.parallel import ParallelStress
 from corecycler.engine.scheduler import CoreScheduler, SchedulerConfig
@@ -478,6 +479,7 @@ class TunerEngine(QObject):
         # Multi-core validation state
         self._validation_stage: int = 0  # 0 = not validating, 1/2/3 = stage
         self._validation_thermal_aborts: int = 0  # consecutive thermal stops in validation
+        self._thermal_cooldown_token = 0
         self._apparatus_fault_streak: int = 0  # consecutive faults with no verdict
         self._validation_core_index: int = 0  # index into _validation_core_order for stage 1
         self._validation_core_order: list[int] = []  # cores to cycle through in stage 1
@@ -618,6 +620,7 @@ class TunerEngine(QObject):
                 "Resume ignored: the current test is still finishing (pause takes effect after it completes)."
             )
             return
+        self._thermal_cooldown_token += 1
         self._abort_requested = False
         self._paused = False
         self._validation_stage = 0
@@ -880,6 +883,7 @@ class TunerEngine(QObject):
             if session is not None and session.status == "quarantined":
                 self.log_message.emit("Pause ignored: the session is quarantined and stays that way.")
                 return
+        self._thermal_cooldown_token += 1
         self._paused = True
         self._set_status("paused")
         if self._session_id:
@@ -888,6 +892,7 @@ class TunerEngine(QObject):
 
     def abort(self) -> None:
         """Stop immediately, revert CO to baseline, save state."""
+        self._thermal_cooldown_token += 1
         self._abort_requested = True
         tested_core: int | None = None
         if self._worker is not None:
@@ -2556,10 +2561,7 @@ class TunerEngine(QObject):
                 if self._session_id is not None:
                     tp.set_hunting_core(self._db, self._session_id, None)
                 self.log_message.emit(f"Crash hunt: core {core_id} thermal stop — cooling down, retrying the same slot")
-                QTimer.singleShot(
-                    int(self._config.thermal_cooldown_seconds * 1000),
-                    self._run_next_hunt_slot,
-                )
+                self._cool_down_before_retry(self._run_next_hunt_slot, self._validation_thermal_aborts)
             elif self._validation_stage == 0:
                 self._handle_thermal_abort(core_id, cs, duration)
             else:
@@ -2791,6 +2793,45 @@ class TunerEngine(QObject):
                 fft_preset=fft_preset,
             )
 
+    def _cool_down_before_retry(self, retry, attempt: int) -> None:
+        """Wait for measured recovery, with longer rests after repeated stops.
+
+        No other stress test runs during this cooldown. Require three seconds
+        continuously below limit minus 5 C; never spin forever on bad cooling.
+        """
+        self._thermal_cooldown_token += 1
+        token = self._thermal_cooldown_token
+        delay = min(120.0, self._config.thermal_cooldown_seconds * 2 ** min(max(attempt - 1, 0), 5))
+        remaining = 180
+        cool_samples = 0
+        self.log_message.emit(
+            f"Cooling down for at least {delay:g}s; waiting for CPU below "
+            f"{self._config.max_temperature_c - 5:g} C before retrying the same test."
+        )
+
+        def check() -> None:
+            nonlocal remaining, cool_samples
+            if token != self._thermal_cooldown_token or self._paused or self._abort_requested:
+                return
+            temperature = read_cpu_temperature()
+            if temperature is None:
+                self.log_message.emit("Cooldown: CPU temperature is unavailable. Pausing with progress saved.")
+                self._pause_for_thermal_limit()
+                return
+            cool_samples = cool_samples + 1 if temperature < self._config.max_temperature_c - 5 else 0
+            if cool_samples >= 4:  # Four readings one second apart span three seconds.
+                self.log_message.emit(f"CPU cooled to {temperature:.1f} C — retrying the same test.")
+                retry()
+                return
+            remaining -= 1
+            if remaining <= 0:
+                self.log_message.emit("CPU did not cool enough within three minutes. Pausing with progress saved.")
+                self._pause_for_thermal_limit()
+                return
+            QTimer.singleShot(1000, check)
+
+        QTimer.singleShot(int(delay * 1000), check)
+
     def _pause_for_thermal_limit(self) -> None:
         """Stop thermal retry loops without throwing away resumable progress."""
         self._clear_cores_under_stress()
@@ -2849,7 +2890,7 @@ class TunerEngine(QObject):
         # Real wall-clock cooldown before retrying the same offset: crash_cooldown
         # is only a pick-counter and gives no cooling when this is the last active
         # core. QTimer also breaks the _on_test_finished call stack (re-entrancy).
-        QTimer.singleShot(int(self._config.thermal_cooldown_seconds * 1000), self._run_next)
+        self._cool_down_before_retry(self._run_next, cs.thermal_aborts)
 
     def _handle_validation_thermal_abort(self, core_id: int) -> None:
         """A thermal stop during validation is not a stability verdict.
@@ -2876,9 +2917,9 @@ class TunerEngine(QObject):
             f"({self._validation_thermal_aborts}/{self._config.max_thermal_retries}) "
             f"— cooling down, re-running the same step"
         )
-        QTimer.singleShot(
-            int(self._config.thermal_cooldown_seconds * 1000),
+        self._cool_down_before_retry(
             self._run_validation_requeue if self._in_requeue else self._run_validation_next,
+            self._validation_thermal_aborts,
         )
 
     def _handle_apparatus_fault(self, core_id: int, error_msg: str, error_type: str, foreign: dict[int, dict]) -> None:

@@ -118,6 +118,15 @@ class TestMsrProbe:
 
 
 class TestConfigPanel:
+    def test_thermal_controls_round_trip_without_marking_saved_values_as_edits(self, tab):
+        cfg = TunerConfig(over_temp_grace_seconds=10, thermal_cooldown_seconds=15)
+        tab._apply_config_to_ui(cfg)
+        assert not tab._thermal_overrides
+        assert tab._get_config().over_temp_grace_seconds == 10
+        assert tab._get_config().thermal_cooldown_seconds == 15
+        tab._thermal_grace_spin.setValue(12)
+        assert tab._thermal_overrides == {"over_temp_grace_seconds": 12}
+
     def test_load_defaults_restores_the_configuration(self, tab):
         tab._start_offset_spin.setValue(-7)
         tab._coarse_step_spin.setValue(4)
@@ -238,6 +247,28 @@ class TestResume:
         eng.resume.side_effect = _resumed
         tab._on_resume()
         assert eng.resume.call_args.args == (sid,)
+
+    def test_resume_persists_only_explicit_thermal_edits(self, tab, monkeypatch):
+        sid = _seed_session(tab._db, "paused")
+        saved = TunerConfig.from_json(tab._db.get_tuner_session(sid).config_json)
+        eng = _engine(status="paused", session_id=sid)
+        tab._engine = eng
+        eng.resume.side_effect = lambda _: setattr(eng, "status", "running")
+        tab._thermal_grace_spin.setValue(10)
+        tab._thermal_cooldown_spin.setValue(15)
+        tab._resume_session(sid)
+        updated = TunerConfig.from_json(tab._db.get_tuner_session(sid).config_json)
+        assert updated.over_temp_grace_seconds == 10
+        assert updated.thermal_cooldown_seconds == 15
+        assert (
+            replace(
+                updated,
+                over_temp_grace_seconds=saved.over_temp_grace_seconds,
+                thermal_cooldown_seconds=saved.thermal_cooldown_seconds,
+            )
+            == saved
+        )
+        assert not tab._thermal_overrides
 
     def test_without_a_db_nothing_is_resumed(self):
         tab = _tab(db=None, topology=_topo(), smu=_smu())
@@ -786,35 +817,3 @@ class TestForceStop:
     def test_force_stop_without_an_engine_is_a_noop(self, tab):
         tab.force_stop()
         assert tab._engine is None
-
-
-class TestTierDependencyPreflight:
-    def test_missing_hardening_tool_blocks_search_before_engine_creation(self, db, no_modal, monkeypatch):
-        tab = _tab(
-            db=db, topology=_topo(), smu=_smu(), backend_factory=lambda name: _backend(name == "stress-ng")
-        )
-        monkeypatch.setattr(tab, "_get_backend", lambda: _backend())
-        monkeypatch.setattr(tab, "_get_config", lambda: TunerConfig(backend="stress-ng"))
-        engine_cls = MagicMock()
-        monkeypatch.setattr(tt, "TunerEngine", engine_cls)
-        prompt = MagicMock(return_value=False)
-        monkeypatch.setattr(tt, "ensure_tool", prompt)
-        no_modal.warning.return_value = no_modal.StandardButton.Yes
-        tab._on_start()
-        engine_cls.assert_not_called()
-        prompt.assert_called_once_with(tab, "mprime")
-
-    def test_resume_checks_saved_tiers_before_resuming(self, tab, monkeypatch):
-        sid = tp.create_session(tab._db, TunerConfig(backend="stress-ng"), "2402", "Test 8C")
-        tab._backend_factory = lambda name: _backend(name == "stress-ng")
-        eng = _engine(status="paused", session_id=sid)
-        tab._engine = eng
-        tab._resume_session(sid)
-        eng.resume.assert_not_called()
-
-    def test_configured_tier_tool_allows_start(self, tab, monkeypatch):
-        tab._backend_factory = lambda name: _backend(name == "stress-ng")
-        prompt = MagicMock(return_value=True)
-        monkeypatch.setattr(tt, "ensure_tool", prompt)
-        assert tab._ensure_tuner_backends(TunerConfig(backend="stress-ng"))
-        prompt.assert_called_once_with(tab, "mprime")

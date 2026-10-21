@@ -1715,6 +1715,58 @@ class TestStartupFailureIsNotAVerdict:
 # ---------------------------------------------------------------------------
 
 
+class TestMeasuredThermalCooldown:
+    def test_waits_for_stable_recovery_before_retry(self, db, topo, smu, mock_backend):
+        eng = make_engine(db, topo, smu, mock_backend, thermal_cooldown_seconds=15)
+        scheduled = []
+        retried = []
+        temperatures = iter([94, 89, 89, 92, 89, 89, 89, 89])
+        with (
+            patch.object(engine_mod.QTimer, "singleShot", side_effect=lambda ms, fn: scheduled.append((ms, fn))),
+            patch.object(engine_mod, "read_cpu_temperature", side_effect=lambda: next(temperatures)),
+        ):
+            eng._cool_down_before_retry(lambda: retried.append(True), 2)
+            assert scheduled[0][0] == 30000  # Second interruption doubles minimum rest.
+            for _ in range(7):
+                _, check = scheduled.pop(0)
+                check()
+                assert not retried
+            _, check = scheduled.pop(0)
+            check()
+        assert retried == [True]
+        assert not scheduled
+
+    @pytest.mark.parametrize("temperature", [None, 94.0])
+    def test_missing_sensor_or_failed_cooling_pauses_without_retry(self, db, topo, smu, mock_backend, temperature):
+        eng = make_engine(db, topo, smu, mock_backend)
+        scheduled = []
+        retried = []
+        with (
+            patch.object(engine_mod.QTimer, "singleShot", side_effect=lambda ms, fn: scheduled.append(fn)),
+            patch.object(engine_mod, "read_cpu_temperature", return_value=temperature),
+        ):
+            eng._cool_down_before_retry(lambda: retried.append(True), 1)
+            for _ in range(181):
+                if not scheduled:
+                    break
+                scheduled.pop(0)()
+        assert eng.status == "paused"
+        assert not retried
+        assert not scheduled
+
+    def test_pause_cancels_pending_cooldown_even_after_reengagement(self, db, topo, smu, mock_backend):
+        eng = make_engine(db, topo, smu, mock_backend)
+        callbacks = []
+        retried = []
+        with patch.object(engine_mod.QTimer, "singleShot", side_effect=lambda ms, fn: callbacks.append(fn)):
+            eng._cool_down_before_retry(lambda: retried.append(True), 1)
+            eng.pause()
+            eng._paused = False  # Simulate re-engagement before old timer fires.
+            callbacks.pop(0)()
+        assert not callbacks
+        assert not retried
+
+
 class TestThermalPauseRecovery:
     def test_search_thermal_limit_preserves_resumable_offset(self, db, topo, smu, mock_backend):
         cfg = TunerConfig(cores_to_test=[0])

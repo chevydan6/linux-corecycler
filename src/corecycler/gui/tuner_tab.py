@@ -82,6 +82,7 @@ class TunerTab(QWidget):
         self._backend_factory = backend_factory
         self._engine: TunerEngine | None = None
         self._selected_core: int | None = None
+        self._thermal_overrides: dict[str, float] = {}
 
         self._tuner_timer = QTimer(self)
         self._tuner_timer.timeout.connect(self._tick_tuner)
@@ -405,6 +406,34 @@ class TunerTab(QWidget):
         self._validate_dur_spin.setToolTip("Seconds per test during multi-core validation stages")
         timing_layout.addRow("Validate duration:", self._validate_dur_spin)
 
+        self._thermal_grace_spin = QDoubleSpinBox()
+        self._thermal_grace_spin.setRange(0, 3600)
+        self._thermal_grace_spin.setSuffix(" s")
+        self._thermal_grace_spin.setValue(TunerConfig().over_temp_grace_seconds)
+        self._thermal_grace_spin.setToolTip(
+            "Continuous time above the temperature limit before interrupting a test. "
+            "Brief spikes that recover within this time do not stop testing. "
+            "The emergency temperature cutoff still applies immediately. "
+            "Edits also apply when resuming a saved session."
+        )
+        self._thermal_grace_spin.valueChanged.connect(
+            lambda value: self._thermal_overrides.update(over_temp_grace_seconds=value)
+        )
+        timing_layout.addRow("Temperature grace:", self._thermal_grace_spin)
+        self._thermal_cooldown_spin = QDoubleSpinBox()
+        self._thermal_cooldown_spin.setRange(0, 120)
+        self._thermal_cooldown_spin.setSuffix(" s")
+        self._thermal_cooldown_spin.setValue(TunerConfig().thermal_cooldown_seconds)
+        self._thermal_cooldown_spin.setToolTip(
+            "Minimum rest after a thermal interruption. Repeated interruptions lengthen the rest. "
+            "Testing waits until the CPU stays 5 C below the limit for three seconds. "
+            "Edits also apply when resuming a saved session."
+        )
+        self._thermal_cooldown_spin.valueChanged.connect(
+            lambda value: self._thermal_overrides.update(thermal_cooldown_seconds=value)
+        )
+        timing_layout.addRow("Minimum cooldown:", self._thermal_cooldown_spin)
+
         right_col.addWidget(timing_group)
 
         columns.addLayout(right_col)
@@ -435,10 +464,16 @@ class TunerTab(QWidget):
             backend=self._backend_combo.currentText(),
             stress_mode=self._mode_combo.currentText(),
             fft_preset=self._fft_combo.currentText(),
+            over_temp_grace_seconds=self._thermal_grace_spin.value(),
+            thermal_cooldown_seconds=self._thermal_cooldown_spin.value(),
         )
 
     def _load_defaults(self) -> None:
         self._apply_config_to_ui(TunerConfig())
+        self._thermal_overrides = {
+            "over_temp_grace_seconds": self._thermal_grace_spin.value(),
+            "thermal_cooldown_seconds": self._thermal_cooldown_spin.value(),
+        }
 
     def _apply_config_to_ui(self, cfg: TunerConfig) -> None:
         """Reflect a TunerConfig in the config panel widgets.
@@ -447,6 +482,13 @@ class TunerTab(QWidget):
         config, so the panel must show those values — not whatever was left
         in the boxes from before.
         """
+        for widget, value in (
+            (self._thermal_grace_spin, cfg.over_temp_grace_seconds),
+            (self._thermal_cooldown_spin, cfg.thermal_cooldown_seconds),
+        ):
+            widget.blockSignals(True)
+            widget.setValue(value)
+            widget.blockSignals(False)
         self._start_offset_spin.setValue(cfg.start_offset)
         self._coarse_step_spin.setValue(cfg.coarse_step)
         self._fine_step_spin.setValue(cfg.fine_step)
@@ -514,8 +556,6 @@ class TunerTab(QWidget):
         errors = config.validate()
         if errors:
             QMessageBox.warning(self, "Invalid Configuration", "\n".join(errors))
-            return
-        if not self._ensure_tuner_backends(config):
             return
         self._engine = TunerEngine(
             db=self._db,
@@ -637,14 +677,6 @@ class TunerTab(QWidget):
             )
             return
 
-        # Check the saved configuration before constructing an engine or writing CO.
-        session = tp.get_session(self._db, session_id) if self._db else None
-        if session is not None:
-            config = TunerConfig.from_json(session.config_json)
-            self._apply_config_to_ui(config)
-            if not self._ensure_tuner_backends(config):
-                return
-
         # Create engine if needed (cold start resume)
         if self._engine is None:
             if not self._db or not self._topology:
@@ -665,7 +697,17 @@ class TunerTab(QWidget):
         # config panel so the boxes show what is actually being executed.
         session = tp.get_session(self._db, session_id) if self._db else None
         if session is not None:
-            self._apply_config_to_ui(TunerConfig.from_json(session.config_json))
+            cfg = TunerConfig.from_json(session.config_json)
+            for field, value in self._thermal_overrides.items():
+                setattr(cfg, field, value)
+            errors = cfg.validate()
+            if errors:
+                QMessageBox.warning(self, "Invalid Settings", "; ".join(errors))
+                return
+            if self._thermal_overrides:
+                self._db.update_tuner_session_config(session_id, cfg.to_json())
+                self._thermal_overrides.clear()
+            self._apply_config_to_ui(cfg)
         log.info("Resuming tuner session %d with its saved config", session_id)
         for event in tp.get_events(self._db, session_id, limit=20):
             log.info(
@@ -706,9 +748,6 @@ class TunerTab(QWidget):
             return
         backend = self._get_backend()
         if backend is None:
-            return
-        session = tp.get_session(self._db, self._engine.session_id) if self._db else None
-        if session is not None and not self._ensure_tuner_backends(TunerConfig.from_json(session.config_json)):
             return
         self._engine.validate_profile(self._engine.session_id)
         if self._engine.status not in ACTIVE_STATUSES:
@@ -1153,21 +1192,6 @@ class TunerTab(QWidget):
             self._validate_btn.setEnabled(False)
             self._export_btn.setEnabled(False)
         self.tuner_running_changed.emit(running)
-
-    def _ensure_tuner_backends(self, config: TunerConfig) -> bool:
-        """Resolve search AND hardening tools before any tuner CO writes."""
-        from corecycler.engine.backends import get_backend
-
-        names = dict.fromkeys([config.backend, *(tier["backend"] for tier in config.hardening_tiers)])
-        for name in names:
-            try:
-                backend = self._backend_factory(name) if self._backend_factory else get_backend(name)
-            except KeyError:
-                QMessageBox.warning(self, "Unknown Tuner Backend", f"Unknown backend: {name}")
-                return False
-            if backend is None or (not backend.is_available() and not ensure_tool(self, name)):
-                return False
-        return True
 
     def _get_backend(self) -> StressBackend | None:
         if self._backend_factory:

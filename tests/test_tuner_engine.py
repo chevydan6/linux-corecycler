@@ -2564,6 +2564,7 @@ class TestThermalAbort:
             patch("corecycler.tuner.engine.QTimer") as qtimer,
             patch.object(eng, "_revert_core_to_baseline") as revert,
             patch.object(eng, "abort") as abort_,
+            patch.object(eng, "_cool_down_before_retry") as cooldown,
             patch.object(tp, "save_core_state"),
         ):
             eng._handle_thermal_abort(0, cs, duration=42.0)
@@ -2574,11 +2575,8 @@ class TestThermalAbort:
         assert cs.crash_cooldown >= 2  # deferred so other cores test meanwhile
         revert.assert_called_once_with(0)
         abort_.assert_not_called()
-        # retry is scheduled after a REAL wall-clock delay, not run synchronously
-        qtimer.singleShot.assert_called_once()
-        delay_ms, callback = qtimer.singleShot.call_args[0]
-        assert delay_ms == 5000  # 5.0 s
-        assert callback == eng._run_next
+        cooldown.assert_called_once_with(eng._run_next, 1)
+        qtimer.singleShot.assert_not_called()  # measured cooldown owns scheduling
 
     def test_thermal_abort_accumulates_time(self, db, simple_topology, mock_smu, mock_backend):
         eng = self._make_engine(db, simple_topology, mock_smu, mock_backend)
@@ -2767,14 +2765,13 @@ class TestValidationThermal:
         with (
             patch("corecycler.tuner.engine.QTimer") as qtimer,
             patch.object(eng, "abort") as abort_,
+            patch.object(eng, "_cool_down_before_retry") as cooldown,
         ):
             eng._handle_validation_thermal_abort(0)
         assert eng._validation_thermal_aborts == 1
         abort_.assert_not_called()
-        qtimer.singleShot.assert_called_once()
-        delay_ms, callback = qtimer.singleShot.call_args[0]
-        assert delay_ms == 4000
-        assert callback == eng._run_validation_next
+        cooldown.assert_called_once_with(eng._run_validation_next, 1)
+        qtimer.singleShot.assert_not_called()
 
     def test_validation_thermal_pauses_after_cap(self, db, simple_topology, mock_smu, mock_backend):
         eng = self._make_engine(db, simple_topology, mock_smu, mock_backend, max_thermal_retries=3)

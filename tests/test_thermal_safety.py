@@ -40,6 +40,20 @@ class TestTemperatureDebounce:
             assert watch.safe() is True
         assert watch.tripped is False
 
+    def test_configured_grace_tolerates_a_brief_96_degree_spike(self):
+        watch = _watch([96.0, 96.0, 94.0, 96.0, 96.0], grace_seconds=10.0)
+        clock = [0.0]
+        with patch("time.monotonic", side_effect=lambda: clock[0]):
+            assert watch.safe()
+            clock[0] = 7.0
+            assert watch.safe()
+            clock[0] = 8.0
+            assert watch.safe()  # Recovery resets the continuous over-limit window.
+            clock[0] = 9.0
+            assert watch.safe()
+            clock[0] = 19.0
+            assert not watch.safe()  # Sustained overheat is still stopped.
+
     def test_sustained_over_temp_trips_after_grace(self):
         watch = _watch([100.0, 100.0])
         clock = [0.0]
