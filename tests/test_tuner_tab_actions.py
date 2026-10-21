@@ -786,3 +786,35 @@ class TestForceStop:
     def test_force_stop_without_an_engine_is_a_noop(self, tab):
         tab.force_stop()
         assert tab._engine is None
+
+
+class TestTierDependencyPreflight:
+    def test_missing_hardening_tool_blocks_search_before_engine_creation(self, db, no_modal, monkeypatch):
+        tab = _tab(
+            db=db, topology=_topo(), smu=_smu(), backend_factory=lambda name: _backend(name == "stress-ng")
+        )
+        monkeypatch.setattr(tab, "_get_backend", lambda: _backend())
+        monkeypatch.setattr(tab, "_get_config", lambda: TunerConfig(backend="stress-ng"))
+        engine_cls = MagicMock()
+        monkeypatch.setattr(tt, "TunerEngine", engine_cls)
+        prompt = MagicMock(return_value=False)
+        monkeypatch.setattr(tt, "ensure_tool", prompt)
+        no_modal.warning.return_value = no_modal.StandardButton.Yes
+        tab._on_start()
+        engine_cls.assert_not_called()
+        prompt.assert_called_once_with(tab, "mprime")
+
+    def test_resume_checks_saved_tiers_before_resuming(self, tab, monkeypatch):
+        sid = tp.create_session(tab._db, TunerConfig(backend="stress-ng"), "2402", "Test 8C")
+        tab._backend_factory = lambda name: _backend(name == "stress-ng")
+        eng = _engine(status="paused", session_id=sid)
+        tab._engine = eng
+        tab._resume_session(sid)
+        eng.resume.assert_not_called()
+
+    def test_configured_tier_tool_allows_start(self, tab, monkeypatch):
+        tab._backend_factory = lambda name: _backend(name == "stress-ng")
+        prompt = MagicMock(return_value=True)
+        monkeypatch.setattr(tt, "ensure_tool", prompt)
+        assert tab._ensure_tuner_backends(TunerConfig(backend="stress-ng"))
+        prompt.assert_called_once_with(tab, "mprime")
