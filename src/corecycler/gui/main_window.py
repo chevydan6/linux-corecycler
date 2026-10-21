@@ -164,7 +164,16 @@ class MainWindow(QMainWindow):
     def _setup_ui(self) -> None:
         central = QWidget()
         self.setCentralWidget(central)
-        main_layout = QHBoxLayout(central)
+        outer_layout = QVBoxLayout(central)
+        self._activity_banner = QLabel("■ NO AUTO-TUNER TEST RUNNING — Auto-Tuner idle")
+        self._activity_banner.setWordWrap(True)
+        self._activity_banner.setMinimumHeight(64)
+        self._activity_banner.setStyleSheet(
+            "background: #374151; color: white; font-size: 20px; font-weight: bold; padding: 12px; border-radius: 6px;"
+        )
+        outer_layout.addWidget(self._activity_banner)
+        main_layout = QHBoxLayout()
+        outer_layout.addLayout(main_layout)
 
         # left: core grid
         left = QVBoxLayout()
@@ -215,6 +224,8 @@ class MainWindow(QMainWindow):
 
         smu = self._smu_tab.smu if hasattr(self._smu_tab, "smu") else None
         self._tuner_tab = TunerTab(self._history_db, self._topology, smu)
+        self._tuner_tab.activity_changed.connect(self._show_tuner_activity)
+        self._tuner_tab._refresh_activity()
         self._tuner_tab.tuner_running_changed.connect(self._on_tuner_running_changed)
         self._tuner_tab.tuner_core_testing.connect(self._on_tuner_core_update)
         self._tuner_tab.tuner_core_elapsed.connect(self._on_tuner_core_elapsed)
@@ -631,6 +642,14 @@ class MainWindow(QMainWindow):
         self._worker = None
 
     @Slot(bool)
+    def _show_tuner_activity(self, text: str, color: str) -> None:
+        self._activity_banner.setText(text)
+        self._activity_banner.setToolTip(self._tuner_tab._activity_detail)
+        self._activity_banner.setStyleSheet(
+            f"background: {color}; color: white; font-size: 20px; font-weight: bold; padding: 12px; border-radius: 6px;"
+        )
+        self.setWindowTitle(f"CoreCycler — {text}")
+
     def _on_tuner_running_changed(self, running: bool) -> None:
         """Mutual exclusion: disable manual test Start and CO writes when tuner is active."""
         self._start_btn.setEnabled(not running)

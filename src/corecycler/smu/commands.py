@@ -492,6 +492,9 @@ COMMAND_SETS[CPUGeneration.ZEN3_REMBRANDT] = _alias_commands(
     CPUGeneration.ZEN4_PHOENIX,
     CPUGeneration.ZEN3_REMBRANDT,
     get_co_cmd=0x2F,
+    # APU GET takes the bare slot; SET still takes the packed core mask.
+    # Packing GET makes nonzero cores falsely read back zero on Rembrandt.
+    get_co_by_slot=True,
     co_range=(-30, 30),
 )
 COMMAND_SETS[CPUGeneration.ZEN4_DRAGON_RANGE] = _alias_commands(

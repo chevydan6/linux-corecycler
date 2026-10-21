@@ -188,6 +188,29 @@ class TestGetCOOffset:
             assert smu.get_co_offset(0) == -60
 
 
+@pytest.mark.parametrize("core_id", [1, 3, 7])
+def test_rembrandt_verifies_nonzero_core_with_bare_slot(smu_dir, core_id):
+    smu = RyzenSMU(get_commands(CPUGeneration.ZEN3_REMBRANDT), smu_dir)
+    offsets = {}
+
+    def send_set(cmd, args):
+        assert cmd == 0x4B
+        offsets[(args[0] >> 20) & 7] = args[0] & 0xFFFF
+        return SMUResponse(True, (0,) * 6, b"")
+
+    def send_get(cmd, args):
+        assert cmd == 0x2F
+        assert args == (core_id,)
+        return SMUResponse(True, (offsets.get(args[0], 0),) + (0,) * 5, b"")
+
+    with (
+        patch.object(smu, "check_writable", return_value=(True, "OK")),
+        patch.object(smu, "_send_command", side_effect=send_set),
+        patch.object(smu, "_send_rsmu_command", side_effect=send_get),
+    ):
+        assert smu.set_co_offset(core_id, -5)
+
+
 class TestSetCOOffset:
     @staticmethod
     def _mock_set_readback(value):

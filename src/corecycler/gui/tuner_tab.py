@@ -61,6 +61,7 @@ class TunerTab(QWidget):
     """Auto-Tuner tab for the main window."""
 
     # Emitted when tuner starts/stops so MainWindow can disable manual test
+    activity_changed = Signal(str, str)  # headline, color
     tuner_running_changed = Signal(bool)
     tuner_core_testing = Signal(int, str)  # core_id, state ("testing"/"passed"/"failed"/etc)
     tuner_core_elapsed = Signal(int, float)  # core_id, elapsed_seconds
@@ -87,6 +88,8 @@ class TunerTab(QWidget):
         self._active_test_core: int | None = None
         self._test_start_time: float = 0
 
+        self._activity_status = "idle"
+        self._activity_detail = ""
         self._setup_ui()
         self._check_resume()
 
@@ -799,6 +802,7 @@ class TunerTab(QWidget):
         import time
 
         self._test_start_time = time.monotonic()
+        self._refresh_activity()
         if not self._tuner_timer.isActive():
             self._tuner_timer.start(1000)
 
@@ -810,6 +814,7 @@ class TunerTab(QWidget):
         if self._active_test_core == core_id:
             self._active_test_core = None
             self._tuner_timer.stop()
+        self._refresh_activity()
         self._update_core_row(core_id)
         self._add_log_entry(core_id, offset, passed)
 
@@ -843,6 +848,8 @@ class TunerTab(QWidget):
 
     @Slot(str)
     def _on_status_changed(self, status: str) -> None:
+        self._activity_status = status
+        self._refresh_activity()
         if status == "validating":
             self._status_label.setText("Status: Validating")
         else:
@@ -899,8 +906,36 @@ class TunerTab(QWidget):
     @Slot(str)
     def _on_log_message(self, msg: str) -> None:
         log.info("[tuner] %s", msg)
+        self._activity_detail = msg
+        self._refresh_activity()
+
+    def _refresh_activity(self) -> None:
+        """Report a live worker separately from a merely active session."""
+        import time
+
+        worker = getattr(self._engine, "_worker", None)
+        testing = self._active_test_core is not None and worker is not None and worker.isRunning()
+        if testing:
+            elapsed = max(0, int(time.monotonic() - self._test_start_time))
+            core = self._active_test_core
+            cs = self._engine.core_states.get(core)
+            offset = f" | CO {cs.current_offset:+d}" if cs else ""
+            pulse = ("●", "◉")[elapsed % 2]
+            text = f"{pulse} TESTING — Core {core}{offset} | {elapsed // 60:02d}:{elapsed % 60:02d} elapsed"
+            if self._activity_status == "paused":
+                text += " | PAUSE REQUESTED — finishing test"
+            color = "#14532d"
+        elif self._activity_status in ACTIVE_STATUSES:
+            text, color = "● TUNER ACTIVE — preparing next test", "#164e63"
+        elif self._activity_status == "paused":
+            text, color = "Ⅱ PAUSED — NO AUTO-TUNER TEST RUNNING | Fix the issue, then click Resume", "#854d0e"
+        else:
+            text = f"■ NO AUTO-TUNER TEST RUNNING — {status_label(self._activity_status).upper()}"
+            color = "#374151"
+        self.activity_changed.emit(text, color)
 
     def _tick_tuner(self) -> None:
+        self._refresh_activity()
         if self._active_test_core is not None:
             import time
 
