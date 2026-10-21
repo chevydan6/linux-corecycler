@@ -67,9 +67,8 @@ class TunerConfig:
     # Safety
     abort_on_consecutive_failures: int = 0  # 0 = disabled
 
-    # Apparatus circuit breaker: this many consecutive FAILs on one core (each
-    # backoff step ADDS voltage, so a healthy apparatus cannot do this) rolls
-    # the core back to its most aggressive proven pass and pauses. 0 disables.
+    # Legacy setting retained for saved-session compatibility. Failure streaks
+    # no longer pause tuning; a hardening failure at baseline does.
     apparatus_failure_streak: int = 12
 
     # Resume-crash circuit breaker. After this many consecutive crash-resumes with

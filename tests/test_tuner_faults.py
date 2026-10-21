@@ -1711,100 +1711,155 @@ class TestStartupFailureIsNotAVerdict:
 
 
 # ---------------------------------------------------------------------------
-# Apparatus circuit breaker: implausible fail streaks recover from evidence
+# Normal hardening failures back off; only a tested baseline failure pauses.
 # ---------------------------------------------------------------------------
 
 
-class TestApparatusBreaker:
-    def _seed(self, db, topo, smu, backend, streak_threshold=5):
-        sid = tp.create_session(
-            db,
-            TunerConfig(cores_to_test=[0], apparatus_failure_streak=streak_threshold),
-            "",
-            "",
-        )
-        eng = make_engine(
-            db,
-            topo,
-            smu,
-            backend,
-            apparatus_failure_streak=streak_threshold,
-        )
+class TestThermalPauseRecovery:
+    def test_search_thermal_limit_preserves_resumable_offset(self, db, topo, smu, mock_backend):
+        cfg = TunerConfig(cores_to_test=[0])
+        sid = tp.create_session(db, cfg, "", "")
+        eng = make_engine(db, topo, smu, mock_backend)
         eng._session_id = sid
         cs = CoreState(
             core_id=0,
-            phase=TunerPhase.BACKOFF_PRECONFIRM,
-            current_offset=-20,
+            phase=TunerPhase.FINE_SEARCH,
+            current_offset=-21,
             best_offset=-20,
             baseline_offset=0,
-            backoff_mode=True,
+            thermal_aborts=cfg.max_thermal_retries,
+        )
+        eng._core_states = {0: cs}
+        eng._co_applied[0] = -21
+        with patch.object(eng, "_run_next") as next_test:
+            eng._on_test_finished(0, False, "temperature limit", "thermal", 8.0, 0.0)
+        assert eng.status == "paused"
+        assert not eng._abort_requested
+        next_test.assert_not_called()
+        assert smu.applied[0] == 0
+        saved = tp.load_core_states(db, sid)[0]
+        assert saved.current_offset == -21
+        assert saved.phase == TunerPhase.FINE_SEARCH
+        assert saved.thermal_aborts == cfg.max_thermal_retries + 1
+        assert not saved.in_test
+        assert sid in [s.id for s in db.list_recoverable_tuner_sessions()]
+        resumed = _resume_fresh(db, topo, smu, mock_backend, sid)
+        assert resumed.status != "paused"
+        assert resumed.core_states[0].current_offset == -21
+        assert resumed.core_states[0].thermal_aborts == 0
+        assert not tp.get_test_log(db, sid)  # heat is not an instability verdict
+
+    def test_validation_thermal_pause_keeps_cursor_and_reverts_all_cores(self, db, topo, smu, mock_backend):
+        sid = tp.create_session(db, TunerConfig(cores_to_test=[0, 1]), "", "")
+        eng = make_engine(db, topo, smu, mock_backend)
+        eng._session_id = sid
+        eng._core_states = {
+            i: CoreState(core_id=i, phase=TunerPhase.CONFIRMED, current_offset=-20, best_offset=-20, baseline_offset=0)
+            for i in (0, 1)
+        }
+        eng._co_applied = {0: -20, 1: -20}
+        eng._validation_stage = 2
+        eng._validation_core_index = 1
+        eng._validation_thermal_aborts = eng._config.max_thermal_retries
+        eng._handle_validation_thermal_abort(0)
+        assert eng.status == "paused"
+        assert not eng._abort_requested
+        assert smu.applied == {0: 0, 1: 0}
+        session = tp.get_session(db, sid)
+        assert session.status == "paused"
+        assert session.validation_stage == 2
+        assert session.validation_index == 1
+
+
+class TestHardeningBaseline:
+    def _seed(self, db, topo, smu, backend, offset=-30, baseline=0, direction=-1):
+        tiers = [{"backend": "mprime", "stress_mode": "SSE", "fft_preset": "SMALL"}]
+        cfg = TunerConfig(cores_to_test=[0], hardening_tiers=tiers, direction=direction)
+        sid = tp.create_session(db, cfg, "", "")
+        eng = make_engine(db, topo, smu, backend, hardening_tiers=tiers, direction=direction)
+        eng._session_id = sid
+        cs = CoreState(
+            core_id=0,
+            phase=TunerPhase.HARDENING_T1,
+            current_offset=offset,
+            best_offset=offset,
+            baseline_offset=baseline,
         )
         eng._core_states = {0: cs}
         return eng, sid, cs
 
-    def test_trips_rolls_back_to_evidence_and_pauses(self, db, topo, smu, mock_backend):
-        """The stale-results class: N consecutive FAILs while every step adds
-        voltage is physically implausible — the breaker must roll the core back
-        to its most aggressive PROVEN pass, clear poisoned bounds, and pause."""
-        eng, sid, cs = self._seed(db, topo, smu, mock_backend, streak_threshold=5)
-        tp.log_test_result(db, sid, 0, -44, "confirm", True, duration=300.0)  # proven pass
-        for off in (-24, -23, -22, -21):  # 4 prior fails
-            tp.log_test_result(
-                db,
-                sid,
-                0,
-                off,
-                "backoff_preconfirm",
-                False,
-                error_msg="mprime error: FATAL ERROR",
-                error_type="computation",
-                duration=122.0,
-            )
+    def test_long_failure_streak_continues_to_a_tested_baseline(self, db, topo, smu, mock_backend):
+        eng, sid, cs = self._seed(db, topo, smu, mock_backend)
+        # An easier test passed -30; this must not override harder-test failures.
+        tp.log_test_result(db, sid, 0, -30, "confirm", True, duration=300.0)
+        with patch.object(eng, "_run_next"):
+            for offset in range(-30, 0):
+                assert cs.current_offset == offset
+                eng._on_test_finished(0, False, "mprime error: FATAL ERROR", "computation", 2.0, 0.0)
+                assert eng._status != "paused"
+                assert cs.phase == TunerPhase.HARDENING_T1
+        assert cs.current_offset == 0
+        assert cs.hardening_tier_index == 0
+        with patch.object(eng, "_run_next"):
+            eng._on_test_finished(0, True, "", "", 300.0, 0.0)
+        assert cs.phase == TunerPhase.HARDENED
+        assert tp.get_test_log(db, sid)[-1]["offset_tested"] == 0
 
-        with patch.object(eng, "_run_next"), patch.object(eng, "_advance_core") as adv:
-            # the 5th consecutive fail crosses the threshold
-            eng._on_test_finished(0, False, "mprime error: FATAL ERROR", "computation", 122.0, 0.0)
-
+    @pytest.mark.parametrize("direction,offset,baseline", [(-1, -1, 0), (-1, -6, -5), (1, 1, 0)])
+    def test_actual_baseline_failure_pauses_without_restoring_easier_pass(
+        self, db, topo, smu, mock_backend, direction, offset, baseline
+    ):
+        eng, sid, cs = self._seed(db, topo, smu, mock_backend, offset, baseline, direction)
+        messages = []
+        eng.log_message.connect(messages.append)
+        with patch.object(eng, "_run_next"):
+            eng._on_test_finished(0, False, "mprime error: FATAL ERROR", "computation", 2.0, 0.0)
+            assert eng._status != "paused"
+            assert cs.current_offset == baseline
+            eng._on_test_finished(0, False, "mprime error: FATAL ERROR", "computation", 2.0, 0.0)
         assert eng._status == "paused"
-        adv.assert_not_called()  # verdict not walked into the search
-        assert cs.best_offset == -44  # rolled back to proven evidence
-        assert cs.current_offset == -44
-        assert cs.phase == TunerPhase.CONFIRMING  # must re-earn confirmation
-        assert cs.backoff_fail_bound is None and cs.backoff_pass_bound is None
-        persisted = db.get_tuner_core_states(sid)[0]
-        assert persisted.best_offset == -44  # rollback is durable
+        assert cs.phase == TunerPhase.HARDENING_T1
+        assert cs.current_offset == baseline
+        assert smu.applied.get(0, baseline) == baseline
+        assert any("failed at baseline" in msg for msg in messages)
+        assert tp.load_core_states(db, sid)[0].phase == TunerPhase.HARDENING_T1
 
-    def test_below_threshold_does_not_trip(self, db, topo, smu, mock_backend):
-        eng, sid, cs = self._seed(db, topo, smu, mock_backend, streak_threshold=5)
-        for off in (-24, -23):
-            tp.log_test_result(db, sid, 0, off, "backoff_preconfirm", False, error_type="computation", duration=122.0)
+    def test_baseline_still_owes_remaining_hardening_tiers(self, db, topo, smu, mock_backend):
+        eng, sid, cs = self._seed(db, topo, smu, mock_backend, offset=-1)
+        eng._config.hardening_tiers.append({"backend": "mprime", "stress_mode": "AVX2", "fft_preset": "SMALL"})
         with patch.object(eng, "_run_next"):
-            eng._on_test_finished(0, False, "mprime error: FATAL ERROR", "computation", 122.0, 0.0)
-        assert eng._status != "paused"  # normal backoff continues
+            eng._on_test_finished(0, False, "mprime error: FATAL ERROR", "computation", 2.0, 0.0)
+            eng._on_test_finished(0, True, "", "", 300.0, 0.0)
+            assert cs.phase == TunerPhase.HARDENING_T2
+            assert cs.current_offset == 0
+            eng._on_test_finished(0, True, "", "", 300.0, 0.0)
+        assert cs.phase == TunerPhase.HARDENED
 
-    def test_pass_breaks_the_streak(self, db, topo, smu, mock_backend):
-        eng, sid, cs = self._seed(db, topo, smu, mock_backend, streak_threshold=5)
-        for off in (-24, -23, -22):
-            tp.log_test_result(db, sid, 0, off, "backoff_preconfirm", False, error_type="computation", duration=122.0)
-        tp.log_test_result(db, sid, 0, -21, "backoff_preconfirm", True, duration=122.0)
-        for off in (-20,):
-            tp.log_test_result(db, sid, 0, off, "backoff_confirm", False, error_type="computation", duration=300.0)
-        with patch.object(eng, "_run_next"):
-            eng._on_test_finished(0, False, "mprime error: FATAL ERROR", "computation", 300.0, 0.0)
-        assert eng._status != "paused"  # streak is 2, not 6
-
-    def test_synthetic_crash_rows_do_not_count(self, db, topo, smu, mock_backend):
-        eng, sid, cs = self._seed(db, topo, smu, mock_backend, streak_threshold=3)
-        # two real fails + two synthetic reboot rows (duration NULL)
-        for off in (-24, -23):
-            tp.log_test_result(db, sid, 0, off, "backoff_preconfirm", False, error_type="computation", duration=122.0)
-        for off in (-22, -21):
-            tp.log_test_result(db, sid, 0, off, "coarse_search", False, error_type="crash", duration=None)
-        with patch.object(eng, "_run_next"):
-            eng._on_test_finished(0, False, "mprime error: FATAL ERROR", "computation", 122.0, 0.0)
-        # real-test streak is 3 (threshold) — trips; but the point is the
-        # synthetic rows alone must not have tripped it earlier: recompute
-        assert eng._status == "paused"
+    def test_recovers_saved_legacy_rollback_at_next_hardening_offset(self, db, topo, smu, mock_backend):
+        eng, sid, cs = self._seed(db, topo, smu, mock_backend)
+        cs.phase = TunerPhase.CONFIRMING
+        tp.log_test_result(db, sid, 0, -30, "confirm", True, duration=300.0)
+        tp.log_test_result(
+            db,
+            sid,
+            0,
+            -19,
+            "hardening_t1",
+            False,
+            duration=8.0,
+            error_type="computation",
+            backend="mprime",
+            stress_mode="SSE",
+            fft_preset="SMALL",
+        )
+        eng._recover_legacy_hardening_rollback()
+        assert cs.phase == TunerPhase.HARDENING_T1
+        assert cs.current_offset == -18
+        assert cs.hardening_tier_index == 0
+        assert tp.load_core_states(db, sid)[0].current_offset == -18
+        # Recovery is idempotent across another restart.
+        eng._recover_legacy_hardening_rollback()
+        assert cs.current_offset == -18
 
 
 # ---------------------------------------------------------------------------

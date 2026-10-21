@@ -655,6 +655,12 @@ class TunerEngine(QObject):
             return
 
         self._core_states = tp.load_core_states(self._db, session_id)
+        # An explicit Resume grants a fresh, bounded thermal retry cycle.
+        self._validation_thermal_aborts = 0
+        for cs in self._core_states.values():
+            if cs.thermal_aborts >= self._config.max_thermal_retries:
+                cs.thermal_aborts = 0
+                tp.save_core_state(self._db, session_id, cs)
 
         # Rebuild the proven-safe envelope from the CO journal: a value the machine
         # survived in a prior boot of this session is still safe (silicon stability
@@ -669,6 +675,7 @@ class TunerEngine(QObject):
 
         # Evidence reconciliation before anything acts on the loaded state.
         self._reconcile_confirmed_evidence()
+        self._recover_legacy_hardening_rollback()
 
         # One reboot verdict drives the drift check, crash detection, and the
         # baseline restore below — they must agree on what world they are in.
@@ -1020,7 +1027,8 @@ class TunerEngine(QObject):
                 if self._at_or_past_baseline(new_offset, cs):
                     cs.current_offset = cs.baseline_offset
                     cs.best_offset = cs.baseline_offset
-                    cs.phase = TunerPhase.HARDENED
+                    # Baseline is a candidate, not a passing result. Run the
+                    # same tier there before advancing or diagnosing a fault.
                 else:
                     cs.current_offset = new_offset
                     cs.best_offset = new_offset
@@ -1407,45 +1415,65 @@ class TunerEngine(QObject):
             cs.phase = TunerPhase.BACKOFF_PRECONFIRM
             cs.backoff_mode = True
 
-    def _apparatus_suspect(self, core_id: int) -> bool:
-        """Trip on a physically implausible fail streak and recover from evidence.
-
-        Post-fail steps only ADD voltage, so a healthy apparatus cannot fail
-        ``apparatus_failure_streak`` times in a row on one core (a broken
-        backend, stale results file, or dying disk can). Roll back to the most
-        aggressive PROVEN pass (passes cannot be faked by a stale error file),
-        clear the backoff bounds, and pause. Synthetic crash rows (duration
-        NULL) are reboots, not apparatus verdicts, and do not count.
-
-        Returns True when tripped (the caller must stop this flow).
-        """
-        threshold = self._config.apparatus_failure_streak
-        if threshold <= 0 or self._session_id is None:
-            return False
-        rows = [
-            r
-            for r in tp.get_test_log(self._db, self._session_id, core_id=core_id)
-            if r.get("duration_seconds") is not None
-        ]
-        streak = 0
-        for r in reversed(rows):
-            if r["passed"]:
-                break
-            streak += 1
-        if streak < threshold:
-            return False
-
+    def _hardening_baseline_failed(self, core_id: int) -> bool:
+        """Pause only after the active hardening test actually fails at baseline."""
         cs = self._core_states[core_id]
-        rollback = self._rollback_core_to_evidence(cs)
+        if cs.phase not in (TunerPhase.HARDENING_T1, TunerPhase.HARDENING_T2):
+            return False
+        if cs.current_offset != cs.baseline_offset:
+            return False
+        backend, mode, preset = self._get_active_stress_config(cs)
         self.log_message.emit(
-            f"APPARATUS SUSPECT: core {core_id} failed {streak} consecutive tests "
-            f"while every step ADDED voltage — implausible for healthy tooling. "
-            f"Rolled back to the most aggressive proven pass ({rollback}); backoff "
-            f"bounds cleared; the core must re-confirm. Check the stress backend, "
-            f"work directory and log, fix the cause, then Resume."
+            f"Core {core_id}: {backend} {mode}/{preset} failed at baseline "
+            f"offset {cs.baseline_offset}. Pausing: this test cannot establish "
+            f"a stable baseline. Check cooling, BIOS settings and the stress "
+            f"backend; no earlier, easier-test pass is being restored."
         )
         self.pause()
         return True
+
+    def _recover_legacy_hardening_rollback(self) -> None:
+        """Undo a saved fail-streak rollback to an easier test's passing value."""
+        if self._session_id is None:
+            return
+        for cs in self._core_states.values():
+            if cs.phase != TunerPhase.CONFIRMING:
+                continue
+            rows = [
+                r
+                for r in tp.get_test_log(self._db, self._session_id, core_id=cs.core_id)
+                if r.get("duration_seconds") is not None
+            ]
+            if not rows:
+                continue
+            last = rows[-1]
+            if last["passed"] or last["phase"] not in ("hardening_t1", "hardening_t2"):
+                continue
+            if not self._is_more_aggressive(cs.current_offset, last["offset_tested"]):
+                continue
+            tiers = [
+                i
+                for i, tier in enumerate(self._config.hardening_tiers)
+                if (tier["backend"], tier["stress_mode"], tier["fft_preset"])
+                == (last.get("backend"), last.get("stress_mode"), last.get("fft_preset"))
+                and i % 2 == (0 if last["phase"] == "hardening_t1" else 1)
+            ]
+            if len(tiers) != 1:
+                continue  # Ambiguous historical tier: re-confirm normally.
+            cs.hardening_tier_index = tiers[0]
+            cs.phase = TunerPhase.HARDENING_T1 if tiers[0] % 2 == 0 else TunerPhase.HARDENING_T2
+            candidate = last["offset_tested"] - self._config.direction * self._config.fine_step
+            cs.current_offset = cs.baseline_offset if self._at_or_past_baseline(candidate, cs) else candidate
+            cs.best_offset = cs.current_offset
+            cs.backoff_mode = False
+            cs.backoff_fail_bound = None
+            cs.backoff_pass_bound = None
+            tp.save_core_state(self._db, self._session_id, cs)
+            self.log_message.emit(
+                f"Core {cs.core_id}: recovered the previous fail-streak pause; "
+                f"continuing hardening at {cs.current_offset} after the recorded "
+                f"failure at {last['offset_tested']}."
+            )
 
     def _most_aggressive_pass(self, core_id: int) -> int | None:
         """Most aggressive offset with a real logged PASS for this core, or None."""
@@ -2522,7 +2550,7 @@ class TunerEngine(QObject):
                         "Crash hunt: thermal limit hit repeatedly — cooling cannot "
                         "sustain hunting. Fix cooling, then Resume."
                     )
-                    self.abort()
+                    self._pause_for_thermal_limit()
                     return
                 self._hunt_queue.insert(0, core_id)
                 if self._session_id is not None:
@@ -2630,13 +2658,14 @@ class TunerEngine(QObject):
         if passed:
             self._consecutive_start_failures = 0
 
-        # Physically implausible fail streaks mean the APPARATUS is lying,
-        # not the silicon — recover from evidence and stop before the state
-        # machine walks proven offsets away (the stale-results.txt class).
-        # Search flow only: validation failures are legitimate consecutive
-        # backoffs, hunt fails are single by design, and isolation passes are
-        # not valid evidence for the all-offsets-live context.
-        if not passed and self._validation_stage == 0 and not self._hunting and self._apparatus_suspect(core_id):
+        # Repeated failures at aggressive offsets are normal search evidence.
+        # Only an actual failure at baseline makes hardening unable to proceed.
+        if (
+            not passed
+            and self._validation_stage == 0
+            and not self._hunting
+            and self._hardening_baseline_failed(core_id)
+        ):
             return
 
         # Hunt slots have their own flow — a fail here is a FOUND CULPRIT.
@@ -2762,6 +2791,18 @@ class TunerEngine(QObject):
                 fft_preset=fft_preset,
             )
 
+    def _pause_for_thermal_limit(self) -> None:
+        """Stop thermal retry loops without throwing away resumable progress."""
+        self._clear_cores_under_stress()
+        self._revert_all_to_baseline()
+        if self._session_id is not None:
+            for cs in self._core_states.values():
+                cs.in_test = False
+                tp.save_core_state(self._db, self._session_id, cs)
+            if self._validation_stage:
+                self._save_validation_pos()
+        self.pause()
+
     def _handle_thermal_abort(self, core_id: int, cs: CoreState, duration: float) -> None:
         """Handle a test stopped by the thermal safety limit (not instability).
 
@@ -2769,8 +2810,8 @@ class TunerEngine(QObject):
         state machine or logging a fail would push the offset the wrong way on a
         thermal transient. Instead: revert the core, defer it (cool down while
         other cores test), and retry the SAME offset. If a core keeps hitting the
-        limit, cooling cannot sustain the test — abort with a clear message rather
-        than silently producing a bad tune.
+        limit, pause with the saved progress intact so the user can resume after
+        addressing cooling.
         """
         cs.thermal_aborts += 1
         if not self._revert_core_to_baseline(core_id):
@@ -2790,12 +2831,12 @@ class TunerEngine(QObject):
                 f"Lower load/ambient or improve cooling, then resume."
             )
             log.warning(
-                "Aborting tune: core %d hit thermal limit %d times (max_thermal_retries=%d)",
+                "Pausing tune: core %d hit thermal limit %d times (max_thermal_retries=%d)",
                 core_id,
                 cs.thermal_aborts,
                 self._config.max_thermal_retries,
             )
-            self.abort()
+            self._pause_for_thermal_limit()
             return
 
         cs.crash_cooldown = max(cs.crash_cooldown, 2)  # prefer other cores meanwhile
@@ -2816,7 +2857,7 @@ class TunerEngine(QObject):
         Backing off a confirmed core and restarting validation (the default
         fail path) on a thermal transient would degrade the tune. Instead: cool
         down and re-run the same validation stage. If the limit keeps tripping,
-        cooling cannot sustain the test — abort with a clear message.
+        cooling cannot sustain the test — pause with a clear message.
         """
         self._validation_thermal_aborts += 1
         if self._validation_thermal_aborts > self._config.max_thermal_retries:
@@ -2825,10 +2866,10 @@ class TunerEngine(QObject):
                 "sustain testing. Lower load/ambient or improve cooling, then resume."
             )
             log.warning(
-                "Aborting validation: thermal limit hit %d times",
+                "Pausing validation: thermal limit hit %d times",
                 self._validation_thermal_aborts,
             )
-            self.abort()
+            self._pause_for_thermal_limit()
             return
         self.log_message.emit(
             f"Validation: core {core_id} thermal abort "

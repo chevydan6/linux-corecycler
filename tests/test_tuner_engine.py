@@ -1767,8 +1767,8 @@ class TestHardeningTransitions:
         assert cs.best_offset == -7
         assert cs.hardening_tier_index == 1  # stays at T2
 
-    def test_hardening_backoff_at_baseline_settles(self, db, simple_topology, mock_smu, mock_backend):
-        """Hardening backoff reaching baseline settles core as HARDENED at baseline."""
+    def test_hardening_backoff_at_baseline_requires_a_pass(self, db, simple_topology, mock_smu, mock_backend):
+        """Hardening backoff reaching baseline must test it before marking HARDENED."""
         tiers = [
             {"backend": "mprime", "stress_mode": "AVX2", "fft_preset": "SMALL"},
         ]
@@ -1783,8 +1783,8 @@ class TestHardeningTransitions:
         )
         eng._core_states = {0: cs}
         eng._advance_core(0, passed=False)
-        # Back off: -1 - ((-1)*1) = 0 = baseline → settle as HARDENED
-        assert cs.phase == TunerPhase.HARDENED
+        # Reaching baseline is not evidence that baseline passed.
+        assert cs.phase == TunerPhase.HARDENING_T1
         assert cs.current_offset == 0
         assert cs.best_offset == 0
 
@@ -2283,7 +2283,7 @@ class TestStateMachineGaps:
 
     # Gap 7: Hardening fail all the way to baseline
     def test_hardening_fail_converges_to_baseline(self, db, simple_topology, mock_smu, mock_backend):
-        """Repeated hardening failures back off until baseline → HARDENED."""
+        """Repeated hardening failures reach baseline, which must pass before HARDENED."""
         tiers = [{"backend": "mprime", "stress_mode": "AVX2", "fft_preset": "SMALL"}]
         eng = self._make_engine(db, simple_topology, mock_smu, mock_backend, fine_step=1, hardening_tiers=tiers)
         cs = CoreState(
@@ -2296,14 +2296,16 @@ class TestStateMachineGaps:
         )
         eng._core_states = {0: cs}
 
-        # Fail 3 times: -3 → -2 → -1 → 0 (baseline) → HARDENED
+        # Fail 3 times: -3 → -2 → -1 → 0; baseline still needs a test.
         eng._advance_core(0, passed=False)
         assert cs.current_offset == -2
         eng._advance_core(0, passed=False)
         assert cs.current_offset == -1
         eng._advance_core(0, passed=False)
-        assert cs.phase == TunerPhase.HARDENED
+        assert cs.phase == TunerPhase.HARDENING_T1
         assert cs.current_offset == 0
+        eng._advance_core(0, passed=True)
+        assert cs.phase == TunerPhase.HARDENED
 
     # Gap 8: 3+ hardening tiers (T1→T2→T1 label cycling)
     def test_three_hardening_tiers(self, db, simple_topology, mock_smu, mock_backend):
@@ -2590,20 +2592,20 @@ class TestThermalAbort:
             eng._handle_thermal_abort(0, cs, duration=30.0)
         assert cs.cumulative_test_time == pytest.approx(30.0)
 
-    def test_aborts_after_retry_cap(self, db, simple_topology, mock_smu, mock_backend):
+    def test_pauses_after_retry_cap(self, db, simple_topology, mock_smu, mock_backend):
         eng = self._make_engine(db, simple_topology, mock_smu, mock_backend, max_thermal_retries=3)
         cs = CoreState(core_id=0, phase=TunerPhase.COARSE_SEARCH, current_offset=-10, thermal_aborts=3)
         eng._core_states = {0: cs}
         with (
             patch("corecycler.tuner.engine.QTimer") as qtimer,
             patch.object(eng, "_revert_core_to_baseline"),
-            patch.object(eng, "abort") as abort_,
+            patch.object(eng, "_pause_for_thermal_limit") as pause_,
             patch.object(tp, "save_core_state"),
         ):
             eng._handle_thermal_abort(0, cs, duration=1.0)
         assert cs.thermal_aborts == 4
-        abort_.assert_called_once()
-        qtimer.singleShot.assert_not_called()  # no retry scheduled once aborting
+        pause_.assert_called_once()
+        qtimer.singleShot.assert_not_called()  # no retry scheduled once paused
 
     def test_thermal_aborts_reset_on_non_thermal_result(self, db, simple_topology, mock_smu, mock_backend):
         # A non-thermal outcome breaks the streak, so transient thermals at
@@ -2774,17 +2776,17 @@ class TestValidationThermal:
         assert delay_ms == 4000
         assert callback == eng._run_validation_next
 
-    def test_validation_thermal_aborts_after_cap(self, db, simple_topology, mock_smu, mock_backend):
+    def test_validation_thermal_pauses_after_cap(self, db, simple_topology, mock_smu, mock_backend):
         eng = self._make_engine(db, simple_topology, mock_smu, mock_backend, max_thermal_retries=3)
         eng._validation_stage = 2
         eng._validation_thermal_aborts = 3
         with (
             patch("corecycler.tuner.engine.QTimer") as qtimer,
-            patch.object(eng, "abort") as abort_,
+            patch.object(eng, "_pause_for_thermal_limit") as pause_,
         ):
             eng._handle_validation_thermal_abort(0)
         assert eng._validation_thermal_aborts == 4
-        abort_.assert_called_once()
+        pause_.assert_called_once()
         qtimer.singleShot.assert_not_called()
 
 
