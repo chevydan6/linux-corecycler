@@ -515,6 +515,8 @@ class TunerTab(QWidget):
         if errors:
             QMessageBox.warning(self, "Invalid Configuration", "\n".join(errors))
             return
+        if not self._ensure_tuner_backends(config):
+            return
         self._engine = TunerEngine(
             db=self._db,
             topology=self._topology,
@@ -635,6 +637,14 @@ class TunerTab(QWidget):
             )
             return
 
+        # Check the saved configuration before constructing an engine or writing CO.
+        session = tp.get_session(self._db, session_id) if self._db else None
+        if session is not None:
+            config = TunerConfig.from_json(session.config_json)
+            self._apply_config_to_ui(config)
+            if not self._ensure_tuner_backends(config):
+                return
+
         # Create engine if needed (cold start resume)
         if self._engine is None:
             if not self._db or not self._topology:
@@ -696,6 +706,9 @@ class TunerTab(QWidget):
             return
         backend = self._get_backend()
         if backend is None:
+            return
+        session = tp.get_session(self._db, self._engine.session_id) if self._db else None
+        if session is not None and not self._ensure_tuner_backends(TunerConfig.from_json(session.config_json)):
             return
         self._engine.validate_profile(self._engine.session_id)
         if self._engine.status not in ACTIVE_STATUSES:
@@ -1140,6 +1153,21 @@ class TunerTab(QWidget):
             self._validate_btn.setEnabled(False)
             self._export_btn.setEnabled(False)
         self.tuner_running_changed.emit(running)
+
+    def _ensure_tuner_backends(self, config: TunerConfig) -> bool:
+        """Resolve search AND hardening tools before any tuner CO writes."""
+        from corecycler.engine.backends import get_backend
+
+        names = dict.fromkeys([config.backend, *(tier["backend"] for tier in config.hardening_tiers)])
+        for name in names:
+            try:
+                backend = self._backend_factory(name) if self._backend_factory else get_backend(name)
+            except KeyError:
+                QMessageBox.warning(self, "Unknown Tuner Backend", f"Unknown backend: {name}")
+                return False
+            if backend is None or (not backend.is_available() and not ensure_tool(self, name)):
+                return False
+        return True
 
     def _get_backend(self) -> StressBackend | None:
         if self._backend_factory:
