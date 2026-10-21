@@ -340,3 +340,27 @@ core ids. Without it, per-core CO is refused on those parts rather than applied
 to the wrong core. Granting the group write access to `smn` also grants it
 arbitrary SMN register access; it is the same trust boundary as the SMU mailbox
 files next to it, so grant it only to a user you would already trust with those.
+
+### Installing mprime for the Auto-Tuner
+
+The Auto-Tuner's default hardening tiers require mprime even when the search
+backend is stress-ng. CoreCycler checks every configured search and hardening
+backend before starting or resuming tuning. A missing tool opens the backend
+selection dialog before any tuner offset writes.
+
+Source/pip installations do not include mprime. It is a separate, free-to-use,
+non-FOSS backend. From this repository, use the Python environment where
+CoreCycler is installed:
+
+```bash
+python scripts/install-mprime.py
+# For a virtual environment:
+.venv/bin/python scripts/install-mprime.py
+```
+
+The Linux x86-64 installer downloads version 30.19b20 from the official GIMPS
+mirror, verifies the SHA256 published on the [GIMPS download page](https://www.mersenne.org/download/),
+checks that the binary starts, and records its absolute path in CoreCycler's
+user configuration. No sudo is needed. Review the included `license.txt` for
+mprime's license. Restart CoreCycler after installation, then resume the saved
+session. The recorded path is also used when CoreCycler runs through sudo.
