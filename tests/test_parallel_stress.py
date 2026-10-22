@@ -166,3 +166,68 @@ class TestLaneBuilding:
         assert runner.work_dir == resolve_work_dir()
         assert "/tmp/corecycler" not in str(runner.work_dir)
         assert not (Path(__file__).parent.parent / "core_0").exists()
+
+
+@pytest.mark.parametrize("requested", [None, 99999, 512])
+def test_memory_backend_shares_one_budget_at_launch(tmp_path, monkeypatch, requested):
+    from types import SimpleNamespace
+
+    backend = RecordingBackend()
+    backend.name = "stressapptest"
+    runner = make_parallel(tmp_path, backend=backend)
+    runner.stress_config.memory_mb = requested
+    calls = []
+    budget = SimpleNamespace(
+        per_instance_mb=2048, minimum_per_instance_mb=256, fits=True, describe=lambda: "two workers sharing 4096 MB"
+    )
+    monkeypatch.setattr(parallel_mod, "memory_budget", lambda n, minimum, **kw: calls.append(n) or budget)
+    seen = []
+
+    def capture(sup, lanes, config_for, duration):
+        for lane in lanes:
+            cfg = config_for(lane)
+            # Verify the actual binary command always receives an explicit cap.
+            from corecycler.engine.backends.stressapptest import StressapptestBackend
+
+            real = StressapptestBackend()
+            monkeypatch.setattr(real, "require_binary", lambda: "stressapptest")
+            command = real.get_command(cfg, lane.work_dir)
+            seen.append(int(command[command.index("-M") + 1]))
+        return {lane.core_id: ok(lane.core_id) for lane in lanes}
+
+    ScriptedSupervisor.script = [capture]
+    runner.run()
+    assert calls == [2]
+    assert seen == [min(requested or 2048, 2048)] * 2
+    assert runner.stress_config.memory_mb == requested
+
+
+def test_unreadable_memory_budget_starts_no_workers(tmp_path, monkeypatch):
+    from corecycler.engine.memory_budget import MemoryBudgetUnavailable
+
+    backend = RecordingBackend()
+    backend.name = "stressapptest"
+    runner = make_parallel(tmp_path, backend=backend)
+
+    def unavailable(*args, **kwargs):
+        raise MemoryBudgetUnavailable("meminfo unavailable")
+
+    monkeypatch.setattr(parallel_mod, "memory_budget", unavailable)
+    results = runner.run()
+    assert results[0].error_type == "startup"
+    assert "meminfo unavailable" in results[0].error_message
+    assert ScriptedSupervisor.created == []
+
+
+def test_insufficient_memory_budget_starts_no_workers(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    backend = RecordingBackend()
+    backend.name = "stressapptest"
+    runner = make_parallel(tmp_path, backend=backend)
+    budget = SimpleNamespace(fits=False, describe=lambda: "only 10 MB available per worker")
+    monkeypatch.setattr(parallel_mod, "memory_budget", lambda *a, **kw: budget)
+    results = runner.run()
+    assert results[0].error_type == "startup"
+    assert "10 MB" in results[0].error_message
+    assert ScriptedSupervisor.created == []

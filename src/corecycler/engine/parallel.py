@@ -9,8 +9,11 @@ from typing import TYPE_CHECKING
 
 from corecycler.config.paths import resolve_work_dir
 from corecycler.engine.backends.base import StressResult
+from corecycler.engine.backends.stressapptest import StressapptestBackend
+from corecycler.engine.containment import lane_cgroup_parent
 from corecycler.engine.detector import ErrorDetector, MCEEvent
 from corecycler.engine.execution import Lane, Supervisor, ThermalWatch
+from corecycler.engine.memory_budget import MemoryBudgetUnavailable, memory_budget
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -83,6 +86,33 @@ class ParallelStress:
         if not lanes:
             return {}
 
+        # Budget at the common launch boundary, including CPU validation stages
+        # configured to use stressapptest. Its automatic allocation is per process.
+        memory_mb = self.stress_config.memory_mb
+        if self.backend.name == "stressapptest":
+            try:
+                budget = memory_budget(
+                    len(lanes),
+                    StressapptestBackend.minimum_memory_mb(max(len(lane.cpus) for lane in lanes)),
+                    lane_cgroup=lane_cgroup_parent(),
+                )
+                if not budget.fits:
+                    raise MemoryBudgetUnavailable(budget.describe())
+                memory_mb = min(memory_mb, budget.per_instance_mb) if memory_mb is not None else budget.per_instance_mb
+                if memory_mb < budget.minimum_per_instance_mb:
+                    raise MemoryBudgetUnavailable(f"requested {memory_mb} MB per instance is below the coverage floor")
+            except MemoryBudgetUnavailable as exc:
+                return {
+                    lanes[0].core_id: StressResult(
+                        core_id=lanes[0].core_id,
+                        passed=False,
+                        duration_seconds=0.0,
+                        error_message=f"Parallel memory budget unavailable: {exc}",
+                        error_type="startup",
+                    )
+                }
+            log.info("Parallel stressapptest memory budget: %s; using %s MB each", budget.describe(), memory_mb)
+
         supervisor = Supervisor(
             backend=self.backend,
             detector=self.detector,
@@ -103,6 +133,7 @@ class ParallelStress:
         def config_for(lane: Lane):
             cfg = copy.copy(self.stress_config)
             cfg.threads = len(lane.cpus)
+            cfg.memory_mb = memory_mb
             return cfg
 
         verdicts = supervisor.run(lanes, config_for, float(self.config.seconds_per_core))
